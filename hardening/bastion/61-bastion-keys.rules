@@ -1,0 +1,3 @@
+-w /home/labadmin/.ssh/ -p wa -k bastion-keys
+-w /home/labadmin/.gnupg/ -p wa -k bastion-keys
+-w /home/labadmin/.ssh/id_ed25519_lab -p r -k ssh-key-use

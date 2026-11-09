@@ -1,0 +1,46 @@
+## Identity and authentication
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+
+## Privilege escalation and PAM
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+-w /etc/pam.d/ -p wa -k pam
+-w /etc/login.defs -p wa -k login
+-w /usr/bin/sudo -p x -k priv-cmd
+-w /usr/bin/su -p x -k priv-cmd
+
+## SSH
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+
+## Scheduled tasks and services
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/systemd/system/ -p wa -k systemd
+
+## Network, firewall, kernel and mount configuration
+-w /etc/ufw/ -p wa -k firewall
+#-w /etc/fail2ban/ -p wa -k firewall
+-w /etc/netplan/ -p wa -k network
+-w /etc/hosts -p wa -k network
+-w /etc/sysctl.d/ -p wa -k sysctl
+-w /etc/sysctl.conf -p wa -k sysctl
+-w /etc/modprobe.d/ -p wa -k modules
+-w /etc/fstab -p wa -k mounts
+-w /etc/audit/ -p wa -k auditconfig
+
+## Login records
+-w /var/log/wtmp -p wa -k logins
+-w /var/log/btmp -p wa -k logins
+
+## System calls
+-a always,exit -F arch=b64 -S adjtimex -S settimeofday -S clock_settime -k time-change
+-a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k modules
+-a always,exit -F arch=b64 -S mount -S umount2 -F auid>=1000 -F auid!=unset -k mounts
+-a always,exit -F arch=b64 -S open -S openat -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access-denied
+-a always,exit -F arch=b64 -S open -S openat -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access-denied
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid-exec
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=unset -k user-cmds
