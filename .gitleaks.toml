@@ -1,0 +1,8 @@
+title = "devsecops-m1 gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented non-secret paths"
+paths = ['''^docs/images/''']

@@ -1,0 +1,29 @@
+# Secrets and key material
+id_*
+!id_*.pub
+*.pem
+*.key
+*.p12
+*.kdbx
+*.secret
+secrets/
+.env
+.env.*
+vault-pass*
+*.vault
+
+# Future modules: state and runtime artefacts
+*.tfstate
+*.tfstate.*
+.terraform/
+*.retry
+
+# Raw audit output (contains system details, so publish sanitized summaries only)
+evidence/raw/
+*.dat
+*.log
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
