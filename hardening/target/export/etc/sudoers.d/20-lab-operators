@@ -1,0 +1,4 @@
+Cmnd_Alias OPS_SSH = /usr/bin/systemctl status ssh --no-pager, \
+                     /usr/bin/systemctl restart ssh, \
+                     /usr/bin/journalctl -u ssh --no-pager
+%lab-operators ALL=(root) OPS_SSH
