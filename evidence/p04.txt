@@ -1,0 +1,66 @@
+secadmin
+target
+Welcome to Ubuntu 24.04.5 LTS (GNU/Linux 6.8.0-147-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+ System information as of Tue Oct 27 10:53:08 AM UTC 2026
+
+  System load:  0.0                Processes:              270
+  Usage of /:   36.2% of 13.16GB   Users logged in:        1
+  Memory usage: 16%                IPv4 address for ens34: 192.168.137.130
+  Swap usage:   0%
+
+ * Canonical Workshop gives developers fast, composable, reproducible, and
+   secure developer environments that are perfect for agentic workflows.
+
+   https://ubuntu.com/workshop
+
+Expanded Security Maintenance for Applications is not enabled.
+
+0 updates can be applied immediately.
+
+Enable ESM Apps to receive additional future security updates.
+See https://ubuntu.com/esm or run: sudo pro status
+
+New release '26.04.1 LTS' available.
+Run 'do-release-upgrade' to upgrade to it.
+
+
+
+
+Welcome to Ubuntu 24.04.5 LTS (GNU/Linux 6.8.0-147-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+ System information as of Tue Oct 27 11:01:45 AM UTC 2026
+
+  System load:  0.0                Processes:              218
+  Usage of /:   36.2% of 13.16GB   Users logged in:        1
+  Memory usage: 16%                IPv4 address for ens34: 192.168.137.130
+  Swap usage:   0%
+
+ * Canonical Workshop gives developers fast, composable, reproducible, and
+   secure developer environments that are perfect for agentic workflows.
+
+   https://ubuntu.com/workshop
+
+Expanded Security Maintenance for Applications is not enabled.
+
+0 updates can be applied immediately.
+
+Enable ESM Apps to receive additional future security updates.
+See https://ubuntu.com/esm or run: sudo pro status
+
+New release '26.04.1 LTS' available.
+Run 'do-release-upgrade' to upgrade to it.
+
+
+
+|1|G+MKvIJjEm8b9EAWPGmouKwOLD0=|Ww/dOALPj7hAkdO+lqKsu52PH+g= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGO+UZPpub0tsz2BRLkxccF3ukb4ntcl6lFqjYv7ifi6
+|1|x8ur+XV6eaEfU8jJu1qtDi0R0Gg=|wOBsbftxV6wFvA7aFPvZnKz5m1o= ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDECpVH6lMtGhCh+HorBcKXjXxYZ7uaZz/LZGYhl9fIGkIoxttgQEkE/VSoZi/uMInq/h+DHfhwYUlcUDLAOJsC7m1bjc/COrxHPJaABdi6VLpcyTZXBrBo8Yn/GmTj4BoVx69gMAusfZcsHA1AZ2+MMNM9x5SwGBJOewhEqzq4vpELq33Np3AslCMcXKhWvYbD8M4Zu5/cCk4hIxuCGRyGzt+oIcbtQ8v0C04SAJES7Cn3g+VdcKJJJfnbWOEd8UjALL7fWv49t4WRfyqsixEOMlTqelftIQPURrA/2cVUkTJidGYNyT1QkXX7wJw+zjiGVAIEE1bAv9V02Umaf63aRdhTgoRKhoHb1Qc/XFJ3Lim1QhdB8yvPgl/IwffzbM2W3i3dpnnd6zMFrL49AgRJIS+0IiuijrLxh2xq6CGeedlru1w+dQUVOJSh7wF6/TX3oVP9Igi9sQSkbuMHKhi1z2Ad1AwmbDzERIpk2i6L+K0dPvXfLP0OEI4APeprSAM=
+|1|cnulvQV8GrcaBtDkCtiyxAjNOiU=|CCuYw+uzFLlkt3p4rHaUwh9iZiM= ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBFdheGFkzFzr/SrnDf16LPCGYhIxzbn87bBATlBCDtp7a7/rKe4A2Ihp2PgKVL9YFv/5JjN70dRTZDHijbjXqZA=

@@ -1,0 +1,37 @@
+git version 2.43.0
+gpg (GnuPG) 2.4.4
+OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13 30 Jan 2024
+enabled
+10.10.10.20     target
+700 /home/labadmin/.ssh
+600 /home/labadmin/.ssh/id_ed25519_lab
+600 /home/labadmin/.ssh/id_ed25519_lab.pub
+600 /home/labadmin/.ssh/config
+256 SHA256:2gEDliaDJJOz3JLPc2/Ygu90Ukl9dqGHSK+ZJUJ9ocM labadmin@bastion-lab (ED25519)
+/home/labadmin/.gnupg/pubring.kbx
+---------------------------------
+sec   ed25519/1925324729FC80AC 2026-10-26 [SC] [expires: 2027-10-26]
+      CF31A8BB458622D2F14F3BFA1925324729FC80AC
+uid                 [ultimate] davidgottlieb13 <davidsitti13@gmail.com>
+
+CF31A8BB458622D2F14F3BFA1925324729FC80AC.rev
+System clock synchronized: yes
+              NTP service: active
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      4096      127.0.0.54:53        0.0.0.0:*          
+LISTEN 0      128        127.0.0.1:6010      0.0.0.0:*          
+LISTEN 0      4096   127.0.0.53%lo:53        0.0.0.0:*          
+LISTEN 0      4096         0.0.0.0:22        0.0.0.0:*          
+LISTEN 0      128            [::1]:6010         [::]:*          
+LISTEN 0      4096            [::]:22           [::]:*          
+authorized_keys
+config
+id_ed25519_lab
+id_ed25519_lab.pub
+gpg-agent.conf
+openpgp-revocs.d
+private-keys-v1.d
+pubring.kbx
+pubring.kbx~
+random_seed
+trustdb.gpg

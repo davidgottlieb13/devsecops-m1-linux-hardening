@@ -1,0 +1,64 @@
+insmod /lib/modules/6.8.0-147-generic/kernel/net/dccp/dccp.ko.zst sctp usb-storage
+Netid State  Recv-Q Send-Q         Local Address:Port Peer Address:PortProcess                                                
+udp   UNCONN 0      0                 127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=672,fd=16))             
+udp   UNCONN 0      0              127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=672,fd=14))             
+udp   UNCONN 0      0      192.168.137.131%ens34:68        0.0.0.0:*    users:(("systemd-network",pid=931,fd=23))             
+tcp   LISTEN 0      4096              127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=672,fd=17))             
+tcp   LISTEN 0      4096           127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=672,fd=15))             
+tcp   LISTEN 0      4096                 0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1449,fd=3),("systemd",pid=1,fd=91))
+tcp   LISTEN 0      4096                    [::]:22           [::]:*    users:(("sshd",pid=1449,fd=4),("systemd",pid=1,fd=92))
+22
+OK   net.ipv4.ip_forward=0
+OK   net.ipv4.conf.all.send_redirects=0
+OK   net.ipv4.conf.default.send_redirects=0
+OK   net.ipv4.conf.all.accept_redirects=0
+OK   net.ipv4.conf.default.accept_redirects=0
+OK   net.ipv4.conf.all.secure_redirects=0
+OK   net.ipv4.conf.default.secure_redirects=0
+OK   net.ipv6.conf.all.accept_redirects=0
+OK   net.ipv6.conf.default.accept_redirects=0
+OK   net.ipv4.conf.all.accept_source_route=0
+OK   net.ipv4.conf.default.accept_source_route=0
+OK   net.ipv6.conf.all.accept_source_route=0
+OK   net.ipv6.conf.default.accept_source_route=0
+OK   net.ipv4.conf.all.rp_filter=1
+OK   net.ipv4.conf.default.rp_filter=1
+OK   net.ipv4.conf.all.log_martians=1
+OK   net.ipv4.conf.default.log_martians=1
+OK   net.ipv4.icmp_echo_ignore_broadcasts=1
+OK   net.ipv4.icmp_ignore_bogus_error_responses=1
+OK   net.ipv4.tcp_syncookies=1
+OK   net.ipv4.tcp_rfc1337=1
+OK   net.ipv6.conf.all.disable_ipv6=1
+OK   net.ipv6.conf.default.disable_ipv6=1
+OK   kernel.randomize_va_space=2
+OK   kernel.kptr_restrict=2
+OK   kernel.dmesg_restrict=1
+OK   kernel.yama.ptrace_scope=2
+OK   kernel.sysrq=0
+OK   kernel.kexec_load_disabled=1
+OK   kernel.core_uses_pid=1
+FAIL net.core.bpf_jit_harden want=2 got=
+OK   dev.tty.ldisc_autoload=0
+OK   fs.suid_dumpable=0
+OK   fs.protected_hardlinks=1
+OK   fs.protected_symlinks=1
+FAIL fs.protected_fifos want=2 got=1
+OK   fs.protected_regular=2
+Status: active
+
+To                         Action      From
+--                         ------      ----
+10.10.10.20 22/tcp         ALLOW OUT   Anywhere                   # SSH to Target
+53                         ALLOW OUT   Anywhere                   # DNS
+80/tcp                     ALLOW OUT   Anywhere                   # HTTP (apt)
+443/tcp                    ALLOW OUT   Anywhere                   # HTTPS
+123/udp                    ALLOW OUT   Anywhere                   # NTP
+67/udp                     ALLOW OUT   Anywhere                   # DHCP client
+53 (v6)                    ALLOW OUT   Anywhere (v6)              # DNS
+80/tcp (v6)                ALLOW OUT   Anywhere (v6)              # HTTP (apt)
+443/tcp (v6)               ALLOW OUT   Anywhere (v6)              # HTTPS
+123/udp (v6)               ALLOW OUT   Anywhere (v6)              # NTP
+67/udp (v6)                ALLOW OUT   Anywhere (v6)              # DHCP client
+
+target
