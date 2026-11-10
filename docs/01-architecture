@@ -1,0 +1,203 @@
+# Module 1: Hardening and Securing a Linux Server under VMware Workstation
+
+## Introduction
+
+This module takes a default Ubuntu server and turns it into an auditable, defensible one. We measure the result with Lynis, and every change is documented so it can be reproduced and later automated with Ansible.
+
+Point 1 builds the foundation. A hardened server is only meaningful if the lab it lives in is controlled, so the network design comes before any configuration.
+
+---
+
+# POINT 1: Lab architecture, network isolation & VM provisioning
+
+## 1. Security rationale
+
+| Decision | Why |
+|---|---|
+| **Dedicated isolated network, no host adapter** | The host cannot reach the lab, and the lab cannot reach the host. A compromised or misconfigured VM has no path to your workstation. |
+| **Bastion / Target split** | Mirrors production: one hardened entry point (Bastion) manages the workloads (Target). All admin traffic flows Bastion → Target. |
+| **Target is isolated by default** | The Target only gets internet access during short, deliberate patching windows. |
+| **No SSH server on the Bastion** | It is a client and tooling box. If nothing listens, nothing can be attacked. |
+| **UEFI + Secure Boot** | Verifies the bootloader and kernel chain. A cheap hardening win that Lynis and CIS-style checks appreciate. |
+| **Separate partitions on the Target** | Lets us apply `nodev,nosuid,noexec` per mount in Point 6 and prevents `/var/log` from filling `/`. This must be decided at install time. |
+| **VMware guest isolation features off** | No clipboard, drag-and-drop or shared folders. These are host↔guest channels, and we want none. |
+| **ISO checksum verification** | Supply-chain hygiene from the very first step. |
+
+## 2. Target architecture
+
+```
+                 ┌────────────────────────── HOST (Windows) ──────────────────────────┐
+                 │  VMware Workstation + docs only. No host adapter on VMnet2.        │
+                 │                                                                    │
+                 │     VMnet8 (NAT) ── internet                                       │
+                 │        │                 ┊ (Target NIC: connected only             │
+                 │        │                 ┊  during install & patching)             │
+                 │   ┌────┴─────┐       ┌───┴──────┐                                  │
+                 │   │ BASTION  │       │  TARGET  │                                  │
+                 │   │ .10      │───────│  .20     │                                  │
+                 │   └──────────┘       └──────────┘                                  │
+                 │        VMnet2: 10.10.10.0/24, host-only, NO host adapter, NO DHCP  │
+                 └────────────────────────────────────────────────────────────────────┘
+```
+
+| | Bastion | Target |
+|---|---|---|
+| Role | Control node (tools, keys, Git, later Ansible) | Server to harden |
+| OS | Ubuntu Server 24.04 LTS (standard) | Ubuntu Server 24.04 LTS (**minimized**) |
+| vCPU / RAM | 2 / 2 GB | 2 / 2 GB |
+| Disk (thin) | 25 GB | 30 GB |
+| NIC 1 | VMnet2, `10.10.10.10/24` | VMnet2, `10.10.10.20/24` |
+| NIC 2 | NAT (DHCP) | NAT (DHCP), **disconnected after patching** |
+| sshd | Not installed | Installed |
+
+**Budget check:** 4 vCPU and 4 GB RAM total, which is about 17% of your RAM and half your logical cores. This leaves ample room for later modules (Docker, Kubernetes). Disks are thin-provisioned, so they grow only as used.
+
+**Addressing rule:** the lab NIC has **no gateway and no DNS**. The only default route is on the NAT NIC, so isolated traffic can never leak toward the internet.
+
+---
+
+## 3. Step-by-step instructions
+
+### Step A: Download and verify the ISO (host)
+
+1. Download the **Ubuntu Server 24.04.x LTS** ISO (`live-server-amd64`) from `ubuntu.com/download/server`.
+2. From `releases.ubuntu.com/24.04/`, open `SHA256SUMS` and find the line for your ISO.
+3. In PowerShell (built into Windows, so nothing to install):
+   ```powershell
+   Get-FileHash .\ubuntu-24.04.*-live-server-amd64.iso -Algorithm SHA256
+   ```
+4. The hash must **match exactly**. If it doesn't, delete the ISO and download it again.
+
+### Step B: Create the isolated network (host)
+
+1. VMware Workstation → **Edit → Virtual Network Editor → Change Settings** (accept the admin prompt).
+2. **Add Network…** → choose **VMnet2** → OK.
+3. Select VMnet2 and set:
+   - Type: **Host-only**
+   - ☐ **Connect a host virtual adapter to this network** (**uncheck**)
+   - ☐ **Use local DHCP service to distribute IP address to VMs** (**uncheck**)
+   - Subnet IP: `10.10.10.0`, Subnet mask: `255.255.255.0`
+4. **Apply → OK**. Leave VMnet8 (NAT) at its default.
+
+### Step C: Create the Target VM first
+
+*(File → New Virtual Machine → Custom)*
+
+1. Hardware compatibility: the latest offered. Choose **"I will install the operating system later"**.
+2. Guest OS: Linux → **Ubuntu 64-bit**. Name: `target`.
+3. Processors: 1 processor × **2 cores**. Memory: **2048 MB**.
+4. Network: **Use host-only networking** for now, then change it in step 7. Controller: default. Disk: **NVMe or SCSI**, **30 GB**, **Store as a single file**, **do not** allocate all disk space now.
+5. **Customize Hardware** (before finishing):
+   - **Remove:** Sound Card, Printer, USB Controller (**Remove**).
+   - **Display:** uncheck **Accelerate 3D graphics**.
+   - **New CD/DVD:** use your verified ISO file.
+6. Finish, then open **VM → Settings**:
+   - **Options → Advanced:** Firmware type **UEFI**, ☑ **Enable Secure Boot**.
+   - **Options → Guest Isolation:** ☐ Enable drag and drop, ☐ Enable copy and paste.
+   - **Options → Shared Folders:** **Disabled**.
+7. **Hardware → Network Adapter:** *Custom* → **VMnet2**. Then **Add → Network Adapter** → **NAT**. Both must be ☑ *Connect at power on* for the install.
+
+### Step D: Create the Bastion VM
+
+Repeat Step C with these differences: name `bastion`, disk **25 GB**. Everything else is identical: UEFI + Secure Boot, same removals, same isolation settings, adapter 1 = VMnet2, adapter 2 = NAT.
+
+### Step E: Install Ubuntu on the Target
+
+Power on the VM and follow the installer.
+
+| Screen | Choice |
+|---|---|
+| Language / keyboard | English, your actual keyboard layout |
+| Installation type | **Ubuntu Server (minimized)** |
+| Network | See below |
+| Proxy | Empty |
+| Mirror | Default |
+| Storage | **Custom storage layout** (see below) |
+| Profile | Server name `target`, user `labadmin`, a strong unique password |
+| Ubuntu Pro | **Skip** |
+| OpenSSH | ☑ **Install OpenSSH server**, **do not import** SSH identity |
+| Featured snaps | **Select none** |
+
+**Network:** you will see two interfaces. The one that automatically obtains a `192.168.x.x` address is the **NAT** NIC, so leave it on DHCP. For the other (the lab NIC): **Edit IPv4 → Manual**:
+- Subnet `10.10.10.0/24`, Address `10.10.10.20`, **Gateway: empty**, **DNS: empty**.
+
+**Custom storage layout for the Target (30 GB):**
+1. Select the disk → **Use as Boot Device** (this creates the ESP, about 1 GB).
+2. Add GPT partition: **1 GB, ext4, mounted at `/boot`**.
+3. Add GPT partition: **all remaining space, left unformatted**.
+4. **Create volume group** `vg0` from that partition, then create logical volumes (all **ext4** except swap):
+
+| LV | Size | Mount |
+|---|---|---|
+| root | 8 GB | `/` |
+| var | 6 GB | `/var` |
+| varlog | 3 GB | `/var/log` |
+| audit | 1 GB | `/var/log/audit` |
+| home | 3 GB | `/home` |
+| tmp | 2 GB | `/tmp` |
+| swap | 2 GB | swap |
+
+This leaves about 3 GB of unallocated space in the volume group for safe growth later.
+
+**Why we skip disk encryption (LUKS):** it would require a passphrase at every console boot. For this lab we accept that risk and document it, since the host disk is the real trust boundary. Mention it in the README as a conscious trade-off.
+
+When the install finishes, choose **Reboot Now**. If asked, remove the installation medium. Afterwards, in **Settings → CD/DVD**, uncheck *Connected* (or remove the device).
+
+### Step F: Install Ubuntu on the Bastion
+
+Same flow, with these differences:
+- Installation type: **Ubuntu Server** (standard).
+- Server name `bastion`, user `labadmin`, a different strong password.
+- Lab NIC address: `10.10.10.10/24`, no gateway, no DNS.
+- Storage: the default guided layout is acceptable here. **Do not** enable LVM encryption.
+- **OpenSSH: do NOT install.**
+- Featured snaps: none.
+
+### Step G: First boot checks and cutting the Target's internet
+
+1. Log in at the Bastion console as `labadmin`, then run the validation commands below.
+2. On the Target, **leave the NAT adapter connected**. Point 3 needs it for patching. We will disconnect it right after.
+
+---
+
+## 4. Validation checklist
+
+Run the commands inside the VMs. Save the output (or screenshots) for the README.
+
+**Host checks (PowerShell):**
+
+| # | Check | Expected |
+|---|---|---|
+| H1 | `Get-FileHash` of the ISO vs `SHA256SUMS` | Identical |
+| H2 | `ipconfig /all` | **No adapter** in `10.10.10.0/24` (VMnet2 absent) |
+| H3 | `ping 10.10.10.10` and `ping 10.10.10.20` | **100% loss**. The host cannot reach the lab. |
+
+**Bastion checks:**
+
+| # | Command | Expected |
+|---|---|---|
+| B1 | `lsb_release -d` | `Ubuntu 24.04.x LTS` |
+| B2 | `ip -br a` | One NIC with `10.10.10.10/24`, one NIC with a NAT address |
+| B3 | `ip route` | **Exactly one** `default` route, via the NAT NIC |
+| B4 | `ping -c 3 10.10.10.20` | 0% loss |
+| B5 | `ss -tlnp` | **No listener on port 22** |
+| B6 | `mokutil --sb-state` | `SecureBoot enabled` |
+| B7 | `systemctl is-active ssh` | `inactive` or `unit not found` |
+
+**Target checks:**
+
+| # | Command | Expected |
+|---|---|---|
+| T1 | `lsb_release -d` | `Ubuntu 24.04.x LTS` |
+| T2 | `ip -br a` and `ip route` | Lab NIC `10.10.10.20/24`, single default route via NAT |
+| T3 | `ping -c 3 10.10.10.10` | 0% loss |
+| T4 | `lsblk -f` and `findmnt -rno TARGET \| grep -E '^/(var|tmp|home|boot)'` | Separate mounts for `/boot`, `/var`, `/var/log`, `/var/log/audit`, `/home`, `/tmp` |
+| T5 | `sudo vgs` | `vg0` with about 3 GB `VFree` |
+| T6 | `systemctl is-active ssh` | `active` |
+| T7 | `mokutil --sb-state` | `SecureBoot enabled` |
+| T8 | `sudo passwd -S root` | `root L ...` (locked) |
+
+**Snapshots:** power both VMs off cleanly (`sudo poweroff`), then take a snapshot named `P1-clean-install` on each. Rollback is how we'll make Lynis before/after comparisons honest.
+
+---
+

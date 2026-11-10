@@ -1,0 +1,306 @@
+# POINT 7: Auditing & logging (auditd, journald persistence, log review)
+
+## 1. Security rationale
+
+Prevention (Points 3 to 6) will eventually fail somewhere. Auditing answers the questions that follow: *what happened, who did it, and when?*
+
+| Component | Role |
+|---|---|
+| **auditd** | Kernel-level audit trail. It records security-relevant events (identity file changes, privilege use, module loads, time changes) with the **real login identity** (`auid`) that survives `sudo`. |
+| **Persistent journald** | By default, logs can live only in RAM and vanish at reboot, which is exactly when you need them after an incident. We make them persistent, bounded and compressed. |
+| **Trusted time** | Logs with wrong timestamps are useless for correlation and weak as evidence. The isolated Target needs a time source. |
+| **Immutable audit rules (`-e 2`)** | An attacker who gets root can't quietly switch auditing off without a reboot (which is itself loud). |
+| **Log review routine** | Logs nobody reads are just disk usage. We end with a short, repeatable review checklist. |
+
+**Design decisions:**
+
+- **No rsyslog.** On this minimized image, journald is the single log store, and `auditd` writes its own file to the dedicated `/var/log/audit` partition we created in Point 1. Fewer components to patch.
+- **Time:** the Bastion becomes the lab's **internal NTP server** (chrony), and the Target syncs only from it. This mirrors production practice. It also lets us tighten the Target's firewall from "NTP to anywhere" to "NTP to the Bastion only". The trade-off is a new UDP/123 listener on the Bastion, restricted by UFW to the Target's IP.
+- **Space budgets:** `/var/log/audit` is 1 GB, so 5 files × 50 MB = 250 MB fits comfortably. `/var/log` is 3 GB, so the journal gets a 500 MB cap.
+- **Off-host log shipping** (sending logs to a separate collector) is the real-world next step. It's out of scope here, and we'll note it in the README as a future improvement.
+
+**NAT window:** the Target needs one brief window to install `auditd`. The Bastion's NAT is already connected.
+
+---
+
+## 2. Step-by-step instructions
+
+Order: Bastion (time server, journald, auditd) → Target (everything) → reboot and tests.
+
+### Step A: Bastion as the lab NTP server
+
+On the **Bastion**:
+
+```bash
+sudo apt update
+sudo apt install -y chrony
+```
+
+Installing chrony automatically replaces `systemd-timesyncd`. Configure it to serve **only** the Target:
+
+```bash
+sudo tee /etc/chrony/conf.d/lab-server.conf >/dev/null <<'EOF'
+allow 10.10.10.20
+EOF
+sudo systemctl restart chrony
+sudo ufw allow in from 10.10.10.20 to any port 123 proto udp comment 'NTP for Target'
+```
+
+Verify:
+
+```bash
+chronyc tracking | head -5
+sudo ss -ulpn | grep ':123'
+```
+
+`chronyc tracking` should show a `Reference ID` that isn't `00000000`, and `Leap status : Normal`.
+
+### Step B: Journald persistence (both VMs)
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/60-hardening.conf >/dev/null <<'EOF'
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=500M
+SystemKeepFree=500M
+MaxRetentionSec=3month
+ForwardToSyslog=no
+EOF
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+journalctl --disk-usage
+ls -ld /var/log/journal
+```
+
+`/var/log/journal` should exist with group `systemd-journal`.
+
+### Step C: Target: connect NAT and install auditd
+
+1. In VMware: Target **Network Adapter 2 → ☑ Connected**.
+2. On the Target (as `secadmin`):
+
+```bash
+sudo apt update
+sudo apt install -y auditd
+```
+
+3. On the **Bastion**, install it too (for the key-access rules later):
+
+```bash
+sudo apt install -y auditd
+```
+
+### Step D: auditd configuration (both VMs)
+
+Make rotation fit the 1 GB partition, then check the other safety values:
+
+```bash
+sudo sed -i -E 's/^max_log_file[[:space:]]*=.*/max_log_file = 50/; s/^num_logs[[:space:]]*=.*/num_logs = 5/; s/^max_log_file_action[[:space:]]*=.*/max_log_file_action = ROTATE/' /etc/audit/auditd.conf
+grep -E '^(max_log_file|num_logs|max_log_file_action|space_left|space_left_action|admin_space_left|admin_space_left_action|disk_full_action|disk_error_action) ' /etc/audit/auditd.conf
+```
+
+Record the output. On a disk-pressure event, the distro defaults log to syslog and then **suspend** auditing rather than halt the machine. That trades some integrity for availability, and it's worth one sentence in your README.
+
+Audit processes that start before `auditd` does:
+
+```bash
+echo 'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX audit=1 audit_backlog_limit=8192"' | sudo tee /etc/default/grub.d/60-audit.cfg
+sudo update-grub
+```
+
+### Step E: Audit rules (both VMs)
+
+```bash
+sudo nano /etc/audit/rules.d/60-hardening.rules
+```
+```
+## Identity and authentication
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+
+## Privilege escalation and PAM
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+-w /etc/pam.d/ -p wa -k pam
+-w /etc/login.defs -p wa -k login
+-w /usr/bin/sudo -p x -k priv-cmd
+-w /usr/bin/su -p x -k priv-cmd
+
+## SSH
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+
+## Scheduled tasks and services
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/systemd/system/ -p wa -k systemd
+
+## Network, firewall, kernel and mount configuration
+-w /etc/ufw/ -p wa -k firewall
+-w /etc/fail2ban/ -p wa -k firewall
+-w /etc/netplan/ -p wa -k network
+-w /etc/hosts -p wa -k network
+-w /etc/sysctl.d/ -p wa -k sysctl
+-w /etc/sysctl.conf -p wa -k sysctl
+-w /etc/modprobe.d/ -p wa -k modules
+-w /etc/fstab -p wa -k mounts
+-w /etc/audit/ -p wa -k auditconfig
+
+## Login records
+-w /var/log/wtmp -p wa -k logins
+-w /var/log/btmp -p wa -k logins
+
+## System calls
+-a always,exit -F arch=b64 -S adjtimex -S settimeofday -S clock_settime -k time-change
+-a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k modules
+-a always,exit -F arch=b64 -S mount -S umount2 -F auid>=1000 -F auid!=unset -k mounts
+-a always,exit -F arch=b64 -S open -S openat -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access-denied
+-a always,exit -F arch=b64 -S open -S openat -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access-denied
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid-exec
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=unset -k user-cmds
+```
+
+Notes:
+- **On the Bastion, delete the `/etc/fail2ban/` line.** Watching a path that doesn't exist can make rule loading fail.
+- The `user-cmds` rule records every command run by interactive users. It's valuable for traceability and a bit noisy. If it drowns you, remove it later and we'll discuss.
+- 64-bit syscalls only, because the VM is `amd64`.
+
+**Bastion extra:** it holds your keys, so add a second file:
+
+```bash
+sudo tee /etc/audit/rules.d/61-bastion-keys.rules >/dev/null <<'EOF'
+-w /home/labadmin/.ssh/ -p wa -k bastion-keys
+-w /home/labadmin/.gnupg/ -p wa -k bastion-keys
+-w /home/labadmin/.ssh/id_ed25519_lab -p r -k ssh-key-use
+EOF
+```
+
+Load and check (both VMs):
+
+```bash
+sudo systemctl restart auditd
+sudo augenrules --load
+sudo auditctl -l | wc -l
+sudo auditctl -s | grep -E 'enabled|failure|lost|backlog_limit'
+```
+
+If `augenrules --load` reports an error, it prints the offending rule. Send me that line.
+
+### Step F: Time on the Target
+
+On the Target, point `systemd-timesyncd` at the Bastion only:
+
+```bash
+sudo mkdir -p /etc/systemd/timesyncd.conf.d
+sudo tee /etc/systemd/timesyncd.conf.d/60-lab.conf >/dev/null <<'EOF'
+[Time]
+NTP=10.10.10.10
+FallbackNTP=
+EOF
+sudo systemctl restart systemd-timesyncd
+```
+
+Tighten the Target's firewall so NTP can go to the Bastion only:
+
+```bash
+sudo ufw delete allow out 123/udp
+sudo ufw allow out to 10.10.10.10 port 123 proto udp comment 'NTP to Bastion'
+sudo ufw status numbered
+```
+
+Then do the journald part of Step B and the audit parts of Steps D and E on the Target too, if you haven't already.
+
+### Step G: Close the NAT window, then test
+
+1. Disconnect the Target's **Network Adapter 2**.
+2. Reboot both VMs (`sudo reboot`) so the GRUB audit option takes effect.
+3. After boot, check `cat /proc/cmdline` for `audit=1`, then run the tests below.
+
+### Step H: Generate and find audit events
+
+On the Target:
+
+```bash
+sudo touch /etc/ssh/sshd_config.d/99-test.conf && sudo rm /etc/ssh/sshd_config.d/99-test.conf
+sudo ausearch -k sshd -i -ts recent | tail -20
+```
+
+You should see events for the file creation and removal, with `auid=secadmin` (your real identity, even though the action ran as root).
+
+Failed login attempts, from the Bastion:
+
+```bash
+ssh baduser@target
+```
+
+Then on the Target:
+
+```bash
+sudo ausearch -m USER_LOGIN -sv no -i -ts recent | tail -10
+sudo aureport --failed --summary
+```
+
+### Step I: Make the audit rules immutable (do this last)
+
+```bash
+echo '-e 2' | sudo tee /etc/audit/rules.d/99-finalize.rules
+sudo reboot
+```
+
+After the reboot, `sudo auditctl -s | grep enabled` should show `enabled 2`, and `sudo auditctl -e 1` should be refused. From now on, rule changes require removing this file and rebooting. That's intentional, and Point 8 remediation can still do it if needed. Do the same on the Bastion.
+
+### Step J: Snapshot
+
+Power off cleanly and snapshot both VMs as **`P7-audit-logging`**.
+
+---
+
+## 3. Log review routine (for your README)
+
+A repeatable review you can run daily or after an incident. These are the commands, not just the theory:
+
+| Question | Command |
+|---|---|
+| Warnings or worse this boot? | `sudo journalctl -p warning -b --no-pager \| tail -30` |
+| Who logged in, and with which key? | `sudo journalctl -u ssh --since today --no-pager \| grep -E 'Accepted\|Failed\|Invalid'` |
+| Who used sudo? | `sudo journalctl _COMM=sudo --since today --no-pager` |
+| What did the firewall block? | `sudo journalctl -k --since today --no-pager \| grep 'UFW BLOCK' \| tail` |
+| Who is banned right now? | `sudo fail2ban-client status sshd` |
+| Failed authentication summary | `sudo aureport --failed --summary` |
+| Identity file changes | `sudo ausearch -k identity -ts today -i` |
+| Config tampering | `sudo ausearch -k sshd -k sudoers -k firewall -ts today -i` |
+| Recent logins | `last -n 10` and `sudo lastb \| head` |
+
+---
+
+## 4. Validation checklist
+
+| # | Host | Command | Expected |
+|---|---|---|---|
+| 1 | Bastion | `chronyc tracking \| head -5` | A real reference, `Leap status : Normal` |
+| 2 | Bastion | `sudo ss -ulpn \| grep ':123'` | chronyd listening |
+| 3 | Bastion | `sudo ufw status numbered \| grep 123` | Allowed only from `10.10.10.20` |
+| 4 | Target | `timedatectl timesync-status` (NAT **disconnected**) | `Server: 10.10.10.10`, small offset |
+| 5 | Target | `timedatectl \| grep synchronized` | `System clock synchronized: yes` |
+| 6 | Both | `date -u` on each, compared | Within about a second |
+| 7 | Target | `sudo ufw status numbered \| grep 123` | Only `to 10.10.10.10 ... 123/udp` |
+| 8 | Both | `journalctl --disk-usage` and `ls -ld /var/log/journal` | Directory exists, usage under 500M |
+| 9 | Both | `journalctl --list-boots \| wc -l` (after reboot) | 2 or more (history survived the reboot) |
+| 10 | Both | `grep -E '^(max_log_file\|num_logs\|max_log_file_action) ' /etc/audit/auditd.conf` | `50`, `5`, `ROTATE` |
+| 11 | Both | `cat /proc/cmdline \| grep -o 'audit=1'` | `audit=1` |
+| 12 | Target | `sudo auditctl -l \| wc -l` | Roughly 40 rules, no load errors |
+| 13 | Both | `sudo auditctl -s \| grep -E 'enabled\|lost'` | `enabled 2`, `lost 0` |
+| 14 | Both | `sudo auditctl -e 1` | Refused (immutable) |
+| 15 | Target | Step H file test | Events visible with `auid=secadmin` |
+| 16 | Target | Failed-login `ausearch` / `aureport` | The `baduser` attempt appears |
+| 17 | Bastion | `sudo ausearch -k bastion-keys -i -ts today \| tail` | Shows key-related file activity (may be empty until you touch `~/.ssh`) |
+| 18 | Target | `sudo ls -ld /var/log/audit; sudo ls -l /var/log/audit/audit.log` | Directory `750`, log `600`, both root |
+| 19 | Target | `ip route` | No default route (NAT closed) |
+| 20 | Both | `ssh target hostname` from the Bastion, plus `sudo ufw status` and `systemctl is-active fail2ban` on the Target | Still all working |
+
+

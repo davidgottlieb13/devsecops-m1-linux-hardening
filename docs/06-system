@@ -1,0 +1,276 @@
+# POINT 6: System hardening (sysctl, unused services, mount options, AppArmor)
+
+## 1. Security rationale
+
+Points 3 to 5 secured access and the network path. This point reduces what the system itself exposes if something gets in, and makes post-compromise movement harder.
+
+| Area | Why it matters |
+|---|---|
+| **Kernel parameters (sysctl)** | Turn off network behaviours a server never needs (redirects, source routing, forwarding), and restrict kernel information leaks that help exploit writers (`kptr_restrict`, `dmesg_restrict`, ptrace limits). |
+| **Disabled kernel modules** | Rarely used protocols and filesystems have a long history of kernel vulnerabilities. If the module can't load, the bug can't be reached. |
+| **Unused services** | Every running service is code to patch and a potential listener. Fewer services means a smaller attack surface. |
+| **Mount options** | `nodev`, `nosuid` and `noexec` stop an attacker who can write to `/tmp` or `/var/log` from turning that into code execution or privilege escalation. This pays off the partition layout we chose in Point 1. |
+| **AppArmor** | Mandatory access control: even a compromised service is confined to what its profile allows. |
+
+**Scope:** the full set of changes goes on the **Target**. On the **Bastion** we apply only the sysctl file, the module blacklist, the service inventory and the AppArmor check. Its default single-partition layout doesn't support per-mount options.
+
+**No NAT window is needed in this point.** Everything below uses packages already installed.
+
+**Safety net:** the `P5-firewall` snapshot is your rollback. The only change that can stop the machine from booting is `/etc/fstab`, so we validate it before rebooting.
+
+---
+
+## 2. Step-by-step instructions
+
+Run on the Target as `secadmin` (via SSH from the Bastion is fine, with the Target console as a fallback).
+
+### Step A: Kernel parameters
+
+```bash
+sudo nano /etc/sysctl.d/60-hardening.conf
+```
+```
+# --- Network: no routing, no redirects, no source routing ---
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+# --- Network: spoofing, logging, flood resistance ---
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rfc1337 = 1
+
+# --- IPv6 off (the lab is IPv4-only) ---
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+
+# --- Kernel: information leaks and memory protections ---
+kernel.randomize_va_space = 2
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 2
+kernel.sysrq = 0
+kernel.kexec_load_disabled = 1
+kernel.core_uses_pid = 1
+net.core.bpf_jit_harden = 2
+dev.tty.ldisc_autoload = 0
+
+# --- Filesystem protections ---
+fs.suid_dumpable = 0
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
+```
+
+Notes:
+- `ptrace_scope = 2` means only root can attach debuggers, so `strace` on your own processes won't work for non-root users. That's the point on a server.
+- Disabling IPv6 is a lab decision. In a real environment, decide based on whether you use it.
+
+Apply and verify with a loop that compares the file with live values:
+
+```bash
+sudo sysctl --system 2>&1 | grep -iE 'error|cannot|unknown' || echo "no sysctl errors"
+grep -vE '^\s*(#|$)' /etc/sysctl.d/60-hardening.conf | while IFS='=' read -r k v; do
+  k=$(echo $k); v=$(echo $v); cur=$(sysctl -n "$k" 2>/dev/null)
+  [ "$cur" = "$v" ] && echo "OK   $k=$cur" || echo "FAIL $k want=$v got=$cur"
+done
+```
+
+Every line should say `OK`. If a key reports `FAIL` or an error, tell me which one and we'll investigate. It may not exist on this kernel, or another file in `/etc/sysctl.d` is overriding it (later filenames win).
+
+### Step B: Block unneeded kernel modules
+
+```bash
+sudo nano /etc/modprobe.d/60-hardening.conf
+```
+```
+# Rare filesystems
+install cramfs /bin/false
+install freevxfs /bin/false
+install hfs /bin/false
+install hfsplus /bin/false
+install jffs2 /bin/false
+# Rare network protocols
+install dccp /bin/false
+install sctp /bin/false
+install rds /bin/false
+install tipc /bin/false
+# Removable / DMA-capable hardware (the VM has none)
+install usb-storage /bin/false
+install firewire-core /bin/false
+```
+
+Verify:
+
+```bash
+modprobe -n -v dccp sctp usb-storage 2>&1
+lsmod | grep -E 'dccp|sctp|usb_storage' || echo "none loaded"
+```
+
+### Step C: Inventory and prune services
+
+First **look**. Don't disable anything blind:
+
+```bash
+systemctl list-unit-files --type=service --state=enabled --no-pager
+systemctl list-units --type=service --state=running --no-pager
+sudo ss -tulpn
+```
+
+Compare against this table. **Act only on units that exist on your system**:
+
+| If present | Why it's a candidate | Action |
+|---|---|---|
+| `ModemManager`, `multipathd` | No modems or SAN multipath in a VM | `sudo systemctl disable --now <unit>` |
+| `snapd` (+ `snapd.socket`) | Extra package manager and attack surface; not used on the Target | `sudo systemctl disable --now snapd.service snapd.socket` |
+| `apport`, `motd-news` | Crash reporting and a network-fetching MOTD | `sudo systemctl disable --now <unit>` |
+| `fwupd-refresh`, `udisks2` | Firmware and removable-media management on a headless VM | `sudo systemctl disable --now <unit>` |
+| cloud-init units | We aren't a cloud instance, and cloud-init can rewrite SSH and network config | `sudo touch /etc/cloud/cloud-init.disabled` |
+
+Don't touch: `ssh`, `ufw`, `fail2ban`, `systemd-networkd`, `systemd-resolved`, `systemd-timesyncd`, `unattended-upgrades`, `apparmor`, `polkit`, `dbus`, `cron`.
+
+After pruning, `sudo ss -tulpn` should show: SSH on port 22, the local resolver stubs (`127.0.0.53` and `127.0.0.54`), and the DHCP client on the NAT interface. Nothing else should listen.
+
+### Step D: Mount options
+
+Back up and edit `fstab`:
+
+```bash
+sudo cp -a /etc/fstab /root/fstab.orig
+sudo nano /etc/fstab
+```
+
+In the **options** column (4th field) of each line, set:
+
+| Mount point | Options |
+|---|---|
+| `/boot` | `defaults,nodev,nosuid,noexec` |
+| `/tmp` | `defaults,nodev,nosuid,noexec` |
+| `/var` | `defaults,nodev,nosuid` |
+| `/var/log` | `defaults,nodev,nosuid,noexec` |
+| `/var/log/audit` | `defaults,nodev,nosuid,noexec` |
+| `/home` | `defaults,nodev,nosuid` |
+
+Do **not** put `noexec` on `/var`: dpkg runs package maintainer scripts from `/var/lib/dpkg`, so it would break apt. Leave `/` and `/boot/efi` alone.
+
+Also add shared memory hardening as a new line at the end:
+
+```
+tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0
+```
+
+A typical edited line looks like this (your device paths will differ, so only change the options):
+
+```
+/dev/disk/by-id/dm-uuid-LVM-....  /tmp  ext4  defaults,nodev,nosuid,noexec  0  1
+```
+
+**Validate before applying anything:**
+
+```bash
+sudo findmnt --verify --verbose
+```
+
+Only continue if there are no errors. Then apply without rebooting:
+
+```bash
+sudo mount -o remount /tmp /var /var/log /var/log/audit /home /boot /dev/shm 2>&1
+findmnt -rno TARGET,OPTIONS | grep -E '^/(tmp|var|var/log|var/log/audit|home|boot|dev/shm) '
+```
+
+Functional proof that `noexec` bites:
+
+```bash
+cp /bin/ls /tmp/ls-test && /tmp/ls-test; rm -f /tmp/ls-test
+```
+
+Expected: `Permission denied`.
+
+**If apt ever fails on `/tmp` noexec,** remount temporarily (`sudo mount -o remount,exec /tmp`), run apt, then remount it back with `sudo mount -o remount /tmp`. Tell me if this happens so we can document it.
+
+**If you made a mistake in fstab** and the VM drops to emergency mode, roll back from the console: `cp /root/fstab.orig /etc/fstab` or restore the `P5-firewall` snapshot.
+
+### Step E: AppArmor review
+
+```bash
+cat /sys/module/apparmor/parameters/enabled
+sudo aa-status | head -15
+sysctl kernel.apparmor_restrict_unprivileged_userns
+systemctl is-enabled apparmor
+ps auxZ | grep -v unconfined | head
+```
+
+What to look for:
+- `Y`: AppArmor is active in the kernel.
+- `profiles are loaded` and the count in **enforce** mode, with **no** profiles listed in complain mode. If any are in complain mode, note which ones and tell me.
+- `kernel.apparmor_restrict_unprivileged_userns = 1`: Ubuntu 24.04 blocks unprivileged user namespaces unless a profile allows them, which closes a popular kernel exploit path.
+- `ps auxZ` shows which processes run under a confining profile.
+
+### Step F: Quick wins
+
+Core dumps off, and a stricter default file mode for new files:
+
+```bash
+echo '* hard core 0' | sudo tee /etc/security/limits.d/60-hardening.conf
+sudo sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs
+grep -E '^UMASK' /etc/login.defs
+```
+
+`UMASK 027` means new files aren't world-readable. It applies to **newly created** files and accounts, not existing ones.
+
+### Step G: Bastion (reduced set)
+
+Repeat **Step A** (same file contents, same verify loop), **Step B**, the **inventory commands and pruning** from **Step C**, **Step E**, and **Step F** on the Bastion. Skip Step D. Don't disable anything on the Bastion that you rely on (`ufw`, `ssh` client tooling, `systemd-*`).
+
+### Step H: Reboot test and snapshot
+
+```bash
+sudo reboot
+```
+
+After the reboot, re-run the sysctl verify loop and the `findmnt` check, plus `sudo ufw status` and `systemctl is-active fail2ban`. Everything must persist. Then power off cleanly and snapshot both VMs as **`P6-system-hardening`**.
+
+---
+
+## 3. Validation checklist
+
+| # | Host | Command | Expected |
+|---|---|---|---|
+| 1 | Target | The sysctl verify loop (Step A) | All lines `OK`, no `FAIL` |
+| 2 | Target | `sysctl net.ipv6.conf.all.disable_ipv6 kernel.kptr_restrict kernel.yama.ptrace_scope` | `1`, `2`, `2` |
+| 3 | Target | `modprobe -n -v dccp sctp usb-storage` | `install /bin/false` for each |
+| 4 | Target | `lsmod \| grep -E 'dccp\|sctp\|usb_storage'` | No output |
+| 5 | Target | `sudo ss -tulpn` | Only SSH (22), resolver stubs, and the DHCP client |
+| 6 | Target | `systemctl list-units --type=service --state=running --no-pager \| wc -l` | Record the count (before and after pruning) for the README |
+| 7 | Target | `findmnt -rno TARGET,OPTIONS \| grep -E '^/(tmp\|var/log\|var/log/audit\|boot) '` | Each shows `nodev,nosuid,noexec` |
+| 8 | Target | `findmnt -rno TARGET,OPTIONS \| grep -E '^/(var\|home) '` | `nodev,nosuid`, **no** `noexec` |
+| 9 | Target | `findmnt -no OPTIONS /dev/shm` | Contains `nodev,nosuid,noexec` |
+| 10 | Target | `cp /bin/ls /tmp/ls-test && /tmp/ls-test; rm -f /tmp/ls-test` | `Permission denied` |
+| 11 | Target | `sudo findmnt --verify` | No errors |
+| 12 | Target | `cat /sys/module/apparmor/parameters/enabled` | `Y` |
+| 13 | Target | `sudo aa-status \| head -8` | Profiles loaded, none in complain mode |
+| 14 | Target | `sysctl kernel.apparmor_restrict_unprivileged_userns` | `1` |
+| 15 | Target | `grep '^UMASK' /etc/login.defs` | `UMASK 027` |
+| 16 | Both | After reboot: sysctl loop, `findmnt` check, `sudo ufw status`, `systemctl is-active fail2ban` | All still correct |
+| 17 | Bastion | Sysctl loop, modprobe check, `sudo ss -tulpn`, `sudo aa-status \| head -8` | Same expectations, no unexpected listeners |
+| 18 | Both | `ssh target 'hostname'` from the Bastion | Still works |
+
+Save the outputs (for example into `~/evidence/p06.txt`) for the README.
+
+---

@@ -1,0 +1,209 @@
+# POINT 5: Firewall (default-deny with UFW, minimal allowed services)
+
+## 1. Security rationale
+
+SSH hardening protects the service. The firewall decides whether anything else is reachable at all, and it is the layer that still helps when a service is misconfigured or a new one gets installed by mistake.
+
+| Decision | Why |
+|---|---|
+| **Default deny incoming** | Nothing is reachable unless we explicitly allow it. A forgotten listener stays unreachable. |
+| **Default deny outgoing** | Egress control: malware and attackers need outbound channels (C2, exfiltration, tool downloads). A server that can only reach DNS, NTP, and HTTP(S) has far fewer. |
+| **SSH allowed only from the Bastion's IP** | The management interface is reachable from one host, not from "the network". |
+| **Bastion blocked from the host adapter** | Closes the one isolation gap I flagged in Point 1: the Bastion's NAT NIC could otherwise reach the host's VMnet8 adapter. |
+| **UFW as the front end** | Rules are short, readable, auditable, and easy to automate later with Ansible. Under the hood on 24.04 it programs the kernel's netfilter (nftables backend), so it is not a lesser tool. |
+| **Rollback timer before enabling** | A firewall change on a remote system is the classic way to lock yourself out. A dead-man switch turns that mistake into a 5-minute pause. |
+
+**Coexistence with fail2ban:** fail2ban's nftables action keeps its own table and hooks in *before* UFW's chains. A packet must pass both, so a drop in either wins. They don't conflict, and fail2ban keeps working.
+
+## 2. The rule set
+
+**Target**
+
+| Direction | Rule | Purpose |
+|---|---|---|
+| In | Allow `22/tcp` from `10.10.10.10` only | SSH from the Bastion |
+| In | Everything else denied | |
+| Out | Allow `53` (tcp+udp), `80/tcp`, `443/tcp`, `123/udp`, `67/udp` | DNS, apt, HTTPS, NTP, DHCP client |
+| Out | Everything else denied | |
+
+**Bastion**
+
+| Direction | Rule | Purpose |
+|---|---|---|
+| In | Everything denied | It runs no services |
+| Out | **First:** deny to the host's VMnet8 address | Protect the host |
+| Out | Allow `22/tcp` to `10.10.10.20` | SSH to the Target |
+| Out | Allow `53`, `80/tcp`, `443/tcp`, `123/udp`, `67/udp` | DNS, apt, HTTPS, NTP, DHCP |
+| Out | Everything else denied | |
+
+UFW evaluates rules **in the order they were added**, first match wins, which is why the deny-to-host rule goes first.
+
+## 3. Step-by-step instructions
+
+### Step A: Find the host's VMnet8 address (on the host)
+
+In PowerShell: `ipconfig`. Find **VMware Network Adapter VMnet8** and note its IPv4 address (we'll call it `HOST_VMNET8_IP`, typically ending in `.1`). Reading this is harmless and installs nothing.
+
+### Step B: Target firewall
+
+1. In VMware, set the Target's **Network Adapter 2 → ☑ Connected**. We need the NAT window to make sure `ufw` is installed and to test egress.
+2. Log in to the Target **console** as `secadmin` and check that UFW is present and inactive:
+
+```bash
+command -v ufw || { sudo apt update && sudo apt install -y ufw; }
+sudo ufw status verbose
+```
+
+3. Arm the rollback timer. If something goes wrong, the firewall disables itself in 5 minutes:
+
+```bash
+sudo systemd-run --on-active=300 --unit=ufw-rollback /usr/sbin/ufw disable
+```
+
+4. Apply the policy:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw default deny routed
+
+sudo ufw allow in from 10.10.10.10 to any port 22 proto tcp comment 'SSH from Bastion'
+
+sudo ufw allow out 53 comment 'DNS'
+sudo ufw allow out 80/tcp comment 'HTTP (apt)'
+sudo ufw allow out 443/tcp comment 'HTTPS'
+sudo ufw allow out 123/udp comment 'NTP'
+sudo ufw allow out 67/udp comment 'DHCP client'
+
+sudo ufw logging low
+sudo ufw enable
+sudo ufw status numbered
+```
+
+5. From the Bastion, open a **new** SSH session (`ssh target`) to prove it still works. If it does, cancel the rollback:
+
+```bash
+sudo systemctl stop ufw-rollback.timer
+```
+
+6. Test egress while NAT is connected:
+
+```bash
+curl -sI -m 8 https://archive.ubuntu.com | head -1    # should work
+ping -c 1 -W 2 1.1.1.1                                 # should FAIL (ICMP not allowed out)
+curl -m 5 http://example.com:8080                      # should FAIL (port not allowed)
+```
+
+### Step C: Bastion firewall
+
+On the Bastion console. Replace `HOST_VMNET8_IP` with the value from Step A.
+
+```bash
+sudo systemd-run --on-active=300 --unit=ufw-rollback /usr/sbin/ufw disable
+
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw default deny routed
+
+sudo ufw deny out to HOST_VMNET8_IP comment 'never reach the host'
+sudo ufw allow out to 10.10.10.20 port 22 proto tcp comment 'SSH to Target'
+sudo ufw allow out 53 comment 'DNS'
+sudo ufw allow out 80/tcp comment 'HTTP (apt)'
+sudo ufw allow out 443/tcp comment 'HTTPS'
+sudo ufw allow out 123/udp comment 'NTP'
+sudo ufw allow out 67/udp comment 'DHCP client'
+
+sudo ufw logging low
+sudo ufw enable
+sudo ufw status numbered
+```
+
+Test that apt and SSH still work (`sudo apt update`, `ssh target`), then cancel the timer:
+
+```bash
+sudo systemctl stop ufw-rollback.timer
+```
+
+### Step D: Prove default-deny works
+
+**1. Bastion blocks inbound.** On the Bastion, start a throwaway listener:
+
+```bash
+sudo python3 -m http.server 80 --bind 10.10.10.10
+```
+
+On the Target (the allowed egress port 80 means only the Bastion's inbound deny can stop this):
+
+```bash
+curl -m 5 http://10.10.10.10
+```
+
+It must **time out**. Press Ctrl+C on the Bastion to stop the listener.
+
+**2. Target blocks inbound.** Temporarily allow the Bastion to reach a test port:
+
+```bash
+# On the Bastion
+sudo ufw allow out to 10.10.10.20 port 8080 proto tcp comment 'TEMP test'
+```
+```bash
+# On the Target
+python3 -m http.server 8080 --bind 10.10.10.20
+```
+```bash
+# On the Bastion
+curl -m 5 http://10.10.10.20:8080
+```
+
+It must **time out** (the Target denies everything but SSH). Stop the listener with Ctrl+C, then remove the temporary rule on the Bastion:
+
+```bash
+sudo ufw status numbered          # find the rule number of 'TEMP test'
+sudo ufw delete <number>
+```
+
+**3. Blocks are logged:**
+
+```bash
+sudo journalctl -k --no-pager | grep 'UFW BLOCK' | tail -3
+```
+
+**4. fail2ban still coexists.** Repeat the Point 4 ban test (`ssh baduser@target` four or five times from the Bastion), confirm the ban with `sudo fail2ban-client status sshd` on the Target, then unban with `sudo fail2ban-client set sshd unbanip 10.10.10.10`.
+
+### Step E: Close the NAT window, reboot test, snapshot
+
+1. Disconnect the Target's **Network Adapter 2** again.
+2. Reboot both VMs (`sudo reboot`) to prove the rules **persist**. Run `sudo ufw status verbose` afterward.
+3. Power both off cleanly and snapshot as **`P5-firewall`** on each VM.
+
+### Notes and caveats
+
+- **Time sync on the isolated Target:** with NAT disconnected, `systemd-timesyncd` cannot reach NTP servers, so the Target's clock can drift. That matters for logs and audit trails. We'll deal with it in Point 7 (Bastion as an NTP source or VMware time sync).
+- **ICMP:** UFW's defaults still allow inbound ping. We leave it for diagnostics. Outbound ping is blocked by design.
+- **Troubleshooting:** if networking misbehaves after enabling the firewall, `sudo ufw disable` from the console is your instant undo. If you suspect IPv6, tell me and we'll check, since Point 6 disables it anyway.
+- **For the repo:** these command blocks become `hardening/05-firewall-target.sh` and `hardening/05-firewall-bastion.sh` in Point 9.
+
+---
+
+## 4. Validation checklist
+
+| # | Host | Command | Expected |
+|---|---|---|---|
+| 1 | Target | `sudo ufw status verbose` | `Status: active`, `Default: deny (incoming), deny (outgoing), deny (routed)` |
+| 2 | Target | `sudo ufw status numbered` | Inbound rule: only `22/tcp` from `10.10.10.10`; outbound: the five allows |
+| 3 | Bastion | `sudo ufw status verbose` | Same defaults; the `deny out to HOST_VMNET8_IP` rule is **#1** |
+| 4 | Bastion | `ssh target 'hostname'` | Works |
+| 5 | Bastion | `sudo apt update` | Works |
+| 6 | Target | `curl -sI -m 8 https://archive.ubuntu.com \| head -1` (NAT connected) | HTTP status line returned |
+| 7 | Target | `ping -c 1 -W 2 1.1.1.1` | Fails |
+| 8 | Target | `curl -m 5 http://example.com:8080` | Fails |
+| 9 | Bastion | `curl -m 5 http://HOST_VMNET8_IP` | Fails (blocked by rule #1) |
+| 10 | Target → Bastion | Step D.1 test | Times out |
+| 11 | Bastion → Target | Step D.2 test | Times out |
+| 12 | Target | `sudo journalctl -k --no-pager \| grep 'UFW BLOCK' \| tail -3` | Block entries present |
+| 13 | Target | fail2ban ban/unban | Still works |
+| 14 | Both | `systemctl is-enabled ufw` and `sudo ufw status` after reboot | `enabled` and `active` |
+| 15 | Target | `ip route` after closing NAT | No default route |
+| 16 | Both | `systemctl list-timers 'ufw-rollback*'` | Nothing (timer cancelled) |
+
+---

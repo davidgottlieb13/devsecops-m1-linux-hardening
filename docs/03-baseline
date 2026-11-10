@@ -1,0 +1,231 @@
+# POINT 3: Target baseline (patching, unattended updates, non-root admin, least-privilege sudo)
+
+## 0. A correction to Point 1
+
+I said the Target's NAT adapter would be "disconnected after patching." That is too absolute: Points 4, 5, 7 and 8 install packages (fail2ban, ufw, auditd, Lynis) and need internet. The real discipline is **connect → install → disconnect**. The Target stays isolated by default and we open the NAT adapter only for short, deliberate windows. (A later upgrade would be an apt cache on the Bastion so the Target never touches the internet. We can consider it after the module.)
+
+## 1. Security rationale
+
+| Decision | Why |
+|---|---|
+| **Patch first** | Known vulnerabilities in a fresh image are the cheapest attack path. |
+| **Automatic security updates** | Fixes land without human delay. We restrict them to the `-security` pocket to limit surprises. |
+| **Dedicated admin account; installer account removed** | A generic installer account is a predictable name. We replace it with an account created deliberately, and root stays locked. |
+| **RBAC via groups + `sudoers.d` drop-ins** | Permissions attach to roles (groups), not individuals, and live in small auditable files rather than one edited `/etc/sudoers`. |
+| **No `NOPASSWD`** | Every privilege escalation requires re-authentication. |
+| **Exact commands, no wildcards, `--no-pager`** | Wildcards in sudo rules are routinely abused, and pagers like `less` allow shell escapes. We allow only what each role needs. |
+| **`su` restricted to admins** | Closes a side door around sudo's logging and rules. |
+
+**Roles for this lab:**
+
+| Role (group) | User | Privilege |
+|---|---|---|
+| `lab-admins` | `secadmin` | Full sudo, password required |
+| `lab-operators` | `operator1` | Only three exact commands (service status, restart, SSH logs) |
+
+All of this runs **on the Target console**. Make sure the NAT adapter is still connected.
+
+---
+
+## 2. Step-by-step instructions
+
+### Step A: Patch the Target
+
+Log in as `labadmin` on the Target console:
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt autoremove -y
+test -f /var/run/reboot-required && echo "REBOOT NEEDED"
+```
+
+If it prints `REBOOT NEEDED`, run `sudo reboot` and log back in.
+
+### Step B: Automatic security updates
+
+The minimized image may not include the package, so install it explicitly:
+
+```bash
+sudo apt install -y unattended-upgrades
+```
+
+Enable the periodic jobs with a reproducible file:
+
+```bash
+sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+```
+
+Add a local override. A higher number wins, so we never edit the packaged defaults:
+
+```bash
+sudo tee /etc/apt/apt.conf.d/52unattended-upgrades-local >/dev/null <<'EOF'
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+```
+
+`Automatic-Reboot "false"` is a lab choice. In production you would set a reboot window (e.g. `Automatic-Reboot-Time "03:30"`) so kernel fixes take effect.
+
+By default, Ubuntu's packaged config only allows the main and `-security` origins. Confirm with a dry run:
+
+```bash
+sudo unattended-upgrade --dry-run --debug 2>&1 | grep -E 'Allowed origins|No packages found|Packages that will be upgraded'
+systemctl list-timers 'apt-daily*'
+```
+
+### Step C: Create the roles and users
+
+```bash
+sudo groupadd lab-admins
+sudo groupadd lab-operators
+
+sudo adduser secadmin
+sudo usermod -aG lab-admins secadmin
+
+sudo adduser operator1
+sudo usermod -aG lab-operators operator1
+```
+
+- Use a **strong, unique password** for each account. Leave the GECOS fields (name, phone) blank.
+- Note that `secadmin` is **not** added to the default `sudo` group. Its power comes only from the explicit rule in Step D.
+
+### Step D: Sudoers drop-ins
+
+Always use `visudo`. It validates syntax before saving, and a broken sudoers file can lock you out.
+
+**1. Defaults:**
+
+```bash
+sudo visudo -f /etc/sudoers.d/00-defaults
+```
+```
+Defaults use_pty
+Defaults timestamp_timeout=5
+Defaults passwd_tries=3
+```
+
+**2. Admin role:**
+
+```bash
+sudo visudo -f /etc/sudoers.d/10-lab-admins
+```
+```
+%lab-admins ALL=(ALL:ALL) ALL
+```
+
+**3. Operator role:**
+
+```bash
+sudo visudo -f /etc/sudoers.d/20-lab-operators
+```
+```
+Cmnd_Alias OPS_SSH = /usr/bin/systemctl status ssh --no-pager, \
+                     /usr/bin/systemctl restart ssh, \
+                     /usr/bin/journalctl -u ssh --no-pager
+%lab-operators ALL=(root) OPS_SSH
+```
+
+**4. Check everything:**
+
+```bash
+sudo visudo -c
+ls -l /etc/sudoers.d/
+```
+
+Files must be `-r--r----- root root` (0440). The names have no dots, which sudo requires for them to be read.
+
+### Step E: Prove the roles work, then retire `labadmin`
+
+1. `exit` from `labadmin`, then **log in as `secadmin`** on the console.
+2. Run `sudo whoami`. It must ask for `secadmin`'s password and print `root`.
+3. Log out, log in as `operator1`, and run the operator tests from the checklist below.
+4. Back as `secadmin` (and with `labadmin` logged out), remove the installer account:
+
+```bash
+sudo deluser --remove-home labadmin
+getent passwd labadmin
+```
+
+The second command should print nothing. If anything goes wrong, you have the `P1-clean-install` snapshot to roll back to.
+
+### Step F: Restrict `su` to admins
+
+```bash
+sudo nano /etc/pam.d/su
+```
+
+Find the commented line `# auth required pam_wheel.so` and replace it with:
+
+```
+auth       required   pam_wheel.so group=lab-admins use_uid
+```
+
+Save, then test as `operator1` (checklist item 13).
+
+### Step G: Update the Bastion's SSH config
+
+On the **Bastion**, edit `~/.ssh/config` and change `User labadmin` to `User secadmin` under `Host target`. Key deployment still happens in Point 4.
+
+### Step H: Close the NAT window and snapshot
+
+1. On the Target, run `sudo poweroff`.
+2. In VMware: **Settings → Network Adapter 2 (NAT)** → uncheck **Connect at power on**. (Alternatively, uncheck **Connected** while running.)
+3. Power on and run checks 16 and 17.
+4. Power off and snapshot as **`P3-target-baseline`**.
+
+**Expectation to set:** with NAT disconnected, unattended-upgrades is correctly configured but cannot fetch anything. This is the intended trade-off. We reconnect briefly in later points, and the timers run during those windows.
+
+---
+
+## 3. Validation checklist
+
+Run on the **Target** unless noted.
+
+**While NAT is still connected:**
+
+| # | Command | Expected |
+|---|---|---|
+| 1 | `apt list --upgradable 2>/dev/null \| tail -n +2` | Empty |
+| 2 | `test -f /var/run/reboot-required && echo YES \|\| echo NO` | `NO` |
+| 3 | `apt-config dump \| grep -E 'Periodic::(Update-Package-Lists\|Unattended-Upgrade)'` | Both set to `"1"` |
+| 4 | `sudo unattended-upgrade --dry-run --debug 2>&1 \| grep 'Allowed origins'` | Includes `-security` |
+| 5 | `systemctl list-timers 'apt-daily*'` | Both timers present |
+
+**Users and roles:**
+
+| # | Command | Expected |
+|---|---|---|
+| 6 | `id secadmin; id operator1` | `secadmin` in `lab-admins` and **not** in `sudo`; `operator1` in `lab-operators` |
+| 7 | `getent passwd labadmin` | No output |
+| 8 | `sudo passwd -S root` | `root L ...` (still locked) |
+| 9 | `stat -c '%a %n' /home/secadmin /etc/sudoers.d/*` | `750` for the home; `440` for each sudoers file |
+| 10 | `sudo visudo -c` | `parsed OK` for all files |
+
+**As `secadmin`:**
+
+| # | Command | Expected |
+|---|---|---|
+| 11 | `sudo whoami` | Asks for the password, prints `root` |
+
+**As `operator1`:**
+
+| # | Command | Expected |
+|---|---|---|
+| 12 | `sudo -l` | Lists only the three allowed commands |
+| 13 | `su -` | `su: Permission denied` |
+| 14 | `sudo systemctl status ssh --no-pager` | Allowed |
+| 15 | `sudo apt update` ; `sudo -i` ; `sudo cat /etc/shadow` ; `sudo systemctl status ssh` (no `--no-pager`) | **All denied**, because they don't match the rules exactly. The last one is deliberate. |
+
+**After disconnecting NAT:**
+
+| # | Command | Expected |
+|---|---|---|
+| 16 | `ip route` | **No default route** |
+| 17 | `ping -c 1 -W 2 1.1.1.1` | Fails (network unreachable) |
+| 18 | On the Bastion: `ping -c 3 10.10.10.20` | 0% loss (lab network still works) |
+
+If you want evidence for the README, pipe outputs into `~/evidence/p03.txt` on the machine you're on. Do not record passwords.

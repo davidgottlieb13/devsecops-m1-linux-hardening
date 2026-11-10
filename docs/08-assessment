@@ -1,0 +1,233 @@
+# POINT 8: Security assessment (Lynis before/after, remediation)
+
+## 1. Security rationale
+
+"Hardened" is a claim, and claims need evidence. Lynis audits the system from the inside and produces a **hardening index**, a list of **warnings**, and a list of **suggestions**. We use it to answer three questions:
+
+1. How did a fresh install score?
+2. How much did Points 3 to 7 improve it?
+3. What is left, and which leftovers are fixed, accepted as a deliberate trade-off, or deferred?
+
+**Three measurements, one fair comparison:**
+
+| Run | System state | How |
+|---|---|---|
+| **Baseline** | Fresh install (the `P1-clean-install` snapshot) | On a **clone** of that snapshot |
+| **Hardened** | After Points 3 to 7 | On the real Target |
+| **Remediated** | After the fixes in this point | On the real Target |
+
+**Honesty notes (put these in your README):**
+
+- The baseline already includes the **custom partition layout** from Point 1, so it is slightly better than a default install. We're measuring *our* improvement, not a worst-case stock image.
+- The Lynis score is a **heuristic, not a compliance certificate**. Lynis has tests aligned with CIS controls, but it isn't a CIS benchmark tool. A formal benchmark (OpenSCAP or CIS-CAT) would be an optional stretch.
+- Chasing 100 is not the goal. Some suggestions conflict with our design or trade availability for little gain. Documenting a **justified exception** is a professional outcome.
+- Raw Lynis reports contain hostnames, IPs and package lists. Keep them out of a public repo and publish summaries and sanitized excerpts only.
+
+**Why a clone for the baseline:** reverting the real Target to P1 would risk losing work, and anything saved inside the reverted VM would disappear. A clone is disposable, and the Bastion keeps the evidence.
+
+---
+
+## 2. Step-by-step instructions
+
+### Step A: Prepare evidence storage (Bastion)
+
+```bash
+mkdir -p ~/evidence
+```
+
+### Step B: Baseline run on a clone
+
+1. Power off the **Target** completely. The clone keeps the same IP and host key, so the two must never run together.
+2. In VMware: right-click the Target → **Manage → Clone → From: An existing snapshot → `P1-clean-install` → Create a full clone**. Name it `target-baseline`.
+3. Check the clone's settings: adapter 1 = VMnet2, adapter 2 = NAT, both connected. Power on **only the clone**.
+4. On the clone's console, log in as `labadmin` (the account from the fresh install) and run:
+
+```bash
+sudo apt update
+sudo apt install -y lynis
+sudo lynis audit system
+```
+
+Press Enter when it pauses between sections. It takes a few minutes.
+
+5. Save the reports and move them to the Bastion:
+
+```bash
+sudo cp /var/log/lynis-report.dat ~/lynis-baseline.dat
+sudo cp /var/log/lynis.log ~/lynis-baseline.log
+sudo chown labadmin: ~/lynis-baseline.*
+```
+
+On the **Bastion**:
+
+```bash
+scp labadmin@target:lynis-baseline.dat labadmin@target:lynis-baseline.log ~/evidence/
+```
+
+This connects with a password, since the clone is still a fresh install. The Bastion's firewall allows SSH to `10.10.10.20`, and the host key is identical to the one already pinned. If SSH complains about the key, stop and tell me instead of overriding it.
+
+6. Note the **hardening index**, the count of **warnings**, and the count of **suggestions** (Step E shows the commands).
+7. Power off the clone and delete it (**Manage → Delete from Disk**). It has served its purpose.
+
+*Fallback if your edition can't clone:* revert the Target to `P1-clean-install`, run the same steps, scp the files to the Bastion, then revert to `P7-audit-logging`. The evidence survives because it lives on the Bastion.
+
+### Step C: Hardened run (real Target)
+
+1. Power on the **real Target**, then connect its **Network Adapter 2 (NAT)** for the install window.
+2. On the Target as `secadmin`:
+
+```bash
+sudo apt update
+sudo apt install -y lynis
+sudo lynis audit system
+sudo cp /var/log/lynis-report.dat ~/lynis-hardened.dat
+sudo cp /var/log/lynis.log ~/lynis-hardened.log
+sudo chown secadmin: ~/lynis-hardened.*
+```
+
+3. On the Bastion:
+
+```bash
+scp target:lynis-hardened.dat target:lynis-hardened.log ~/evidence/
+```
+
+### Step D: Remediation batch 1 (safe, high-value fixes)
+
+These address findings that Lynis commonly raises on a build like ours. Your results may differ slightly, so apply what makes sense after reading your own suggestion list (Step E). The NAT window is still open on the Target.
+
+**1. Packages** (note `--no-install-recommends` for AIDE, to avoid pulling in a mail server):
+
+```bash
+sudo apt install -y libpam-pwquality needrestart debsums acct
+sudo apt install -y --no-install-recommends aide aide-common
+```
+
+**2. Password quality and aging:**
+
+```bash
+sudo mkdir -p /etc/security/pwquality.conf.d
+sudo tee /etc/security/pwquality.conf.d/60-lab.conf >/dev/null <<'EOF'
+minlen = 14
+minclass = 3
+maxrepeat = 3
+retry = 3
+EOF
+sudo sed -i -E 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   365/; s/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   1/; s/^PASS_WARN_AGE.*/PASS_WARN_AGE   14/' /etc/login.defs
+sudo chage -M 365 -m 1 -W 14 secadmin
+sudo chage -M 365 -m 1 -W 14 operator1
+```
+
+**3. Legal banners and idle timeout:**
+
+```bash
+echo 'Authorized access only. Activity is monitored and logged.' | sudo tee /etc/issue /etc/issue.net
+sudo tee /etc/profile.d/60-session-timeout.sh >/dev/null <<'EOF'
+readonly TMOUT=600
+export TMOUT
+EOF
+```
+
+**4. Tighten SSH sessions.** Keep an SSH session and the console open while doing this:
+
+```bash
+sudo sed -i 's/^MaxSessions.*/MaxSessions 2/' /etc/ssh/sshd_config.d/00-hardening.conf
+sudo sshd -t && sudo systemctl restart ssh
+```
+
+From the Bastion, open a **new** connection to prove it still works.
+
+**5. File integrity (AIDE).** Build the baseline database. This takes a few minutes:
+
+```bash
+sudo aideinit -y -f
+sudo aide.wrapper --check
+```
+
+The check should report no differences. (AIDE reports changes after every legitimate patch. The update procedure is `sudo aide.wrapper --update`, then promote the new database. We'll add that to the README as maintenance.) If these two AIDE commands behave differently on your system, send me the output.
+
+**6. Reboot** to clear any "deleted files still in use" and pick up service restarts:
+
+```bash
+sudo reboot
+```
+
+Log back in, then close the NAT window (disconnect Network Adapter 2) and run Lynis again, **offline**:
+
+```bash
+sudo lynis audit system
+sudo cp /var/log/lynis-report.dat ~/lynis-remediated.dat
+sudo cp /var/log/lynis.log ~/lynis-remediated.log
+sudo chown secadmin: ~/lynis-remediated.*
+```
+
+On the Bastion:
+
+```bash
+scp target:lynis-remediated.dat target:lynis-remediated.log ~/evidence/
+```
+
+### Step E: Compare the three runs (Bastion)
+
+```bash
+cd ~/evidence
+for f in lynis-baseline.dat lynis-hardened.dat lynis-remediated.dat; do
+  echo "== $f"
+  grep -E '^hardening_index=' $f
+  echo "warnings:    $(grep -c '^warning\[\]=' $f)"
+  echo "suggestions: $(grep -c '^suggestion\[\]=' $f)"
+done
+```
+
+List what remains after remediation, with IDs and descriptions:
+
+```bash
+grep '^suggestion\[\]=' lynis-remediated.dat | cut -d= -f2- | cut -d'|' -f1,2 | sort
+grep '^warning\[\]=' lynis-remediated.dat | cut -d= -f2- | cut -d'|' -f1,2
+```
+
+What the previous steps fixed (suggestions that disappeared between baseline and remediated):
+
+```bash
+for f in baseline remediated; do
+  grep '^suggestion\[\]=' lynis-$f.dat | cut -d= -f2- | cut -d'|' -f1 | sort > $f.ids
+done
+comm -23 baseline.ids remediated.ids | wc -l
+```
+
+### Step F: Triage the leftovers
+
+For every remaining suggestion, decide one of three outcomes and record it in a table for the README:
+
+| Decision | Meaning | Example |
+|---|---|---|
+| **Fix** | Cheap and safe, so we do it | Install a missing package, set a config value |
+| **Accept** | Deliberate trade-off, documented with a reason | `kernel.unprivileged_bpf_disabled = 2` (stricter than what Lynis expects), no remote log server in a two-VM lab |
+| **Defer** | Valuable but out of Module 1's scope | Centralised log shipping, anti-malware scanner, configuration management (that's what Ansible is for) |
+
+**Please don't fix everything blindly.** Send me your remaining list and I'll help sort it into these three buckets in the review.
+
+### Step G: Snapshot
+
+Power off both VMs cleanly and snapshot as **`P8-assessment`**.
+
+---
+
+## 3. Validation checklist
+
+| # | Where | Check | Expected |
+|---|---|---|---|
+| 1 | Bastion | `ls ~/evidence/lynis-*.dat` | Three `.dat` files: baseline, hardened, remediated |
+| 2 | Bastion | Step E comparison loop | Index values recorded for all three |
+| 3 | Bastion | Hardened index vs baseline | **Higher** (record the delta) |
+| 4 | Bastion | Remediated index vs hardened | Higher or equal |
+| 5 | Target | `sudo aide.wrapper --check` | No differences (right after init) |
+| 6 | Target | `sudo sshd -T \| grep -i maxsessions` | `maxsessions 2` |
+| 7 | Target | `sudo chage -l secadmin \| grep -E 'Maximum\|Minimum\|warning'` | 365 / 1 / 14 |
+| 8 | Target | `cat /etc/issue.net` | Banner text present |
+| 9 | Target | `bash -lc 'echo $TMOUT'` | `600` |
+| 10 | Target | `dpkg -l libpam-pwquality needrestart debsums acct aide \| grep ^ii \| wc -l` | `5` or more |
+| 11 | Both | Step E "what disappeared" count | Non-zero (hardening visibly removed findings) |
+| 12 | Target | `ip route` after closing NAT | No default route |
+| 13 | Target | Everything from Points 4 to 7 still working: `ssh target hostname` from the Bastion, `sudo ufw status`, `systemctl is-active fail2ban auditd`, `sudo auditctl -s \| grep enabled` | All healthy, `enabled 2` |
+| 14 | Clone | `target-baseline` VM deleted | Yes, and no leftover VM running with IP `10.10.10.20` |
+

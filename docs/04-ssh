@@ -1,0 +1,231 @@
+# POINT 4: SSH hardening (key-only auth, no root, `sshd_config.d` drop-in, fail2ban)
+
+## 1. Security rationale
+
+SSH is the only door into the Target, so it is the first thing an attacker probes. We close it in layers:
+
+| Control | Threat it addresses |
+|---|---|
+| **Key-only authentication** | Password guessing and credential stuffing become impossible. |
+| **`PermitRootLogin no`** | The highest-value account can't be targeted over the network. |
+| **`AllowGroups lab-admins lab-operators`** | Even valid system accounts can't log in remotely unless they hold an explicit role. |
+| **`MaxAuthTries`, `LoginGraceTime`, `MaxStartups`** | Limits how long and how fast an attacker can hammer the service. |
+| **Forwarding disabled** | The Target can't be abused as a pivot or tunnel endpoint. |
+| **Pinned modern crypto** | A future default change or a downgrade can't silently weaken the channel. |
+| **`LogLevel VERBOSE`** | Logs the key fingerprint used for every login, which gives traceability for audit. |
+| **fail2ban** | Automatically bans sources that keep failing, slowing brute force further. |
+| **Drop-in file, not an edited `sshd_config`** | Our changes live in one small, reviewable, reversible file. |
+
+**Two OpenSSH behaviours worth knowing before we start:**
+
+1. **First value wins.** Ubuntu's `sshd_config` includes `sshd_config.d/*.conf` at the top, and for most options sshd keeps the *first* value it reads, in lexical filename order. That's why our file is named `00-hardening.conf`. It must beat any later file (e.g. a `50-cloud-init.conf` that re-enables passwords).
+2. **Socket activation on Ubuntu 24.04.** SSH may be started by `ssh.socket` on the first connection rather than at boot. That's why `systemctl is-active ssh` can show `inactive` on a healthy server. We keep port 22, so this doesn't change our configuration. We'll just check both units.
+
+**Never lock yourself out:** do the work in this order: deploy key → prove key login works → *then* disable passwords. Keep the Target's VMware console logged in as `secadmin` as your fallback throughout.
+
+---
+
+## 2. Step-by-step instructions
+
+### Step A: Deploy the public key (from the Bastion)
+
+The NAT adapter on the Target can stay disconnected for this step. Password authentication is still on, so `ssh-copy-id` can work.
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519_lab.pub secadmin@target
+```
+
+On the first connection SSH asks you to trust the host key. **Don't just type `yes`.** Verify it, because on a network you don't control this prompt is exactly where a man-in-the-middle would strike:
+
+1. On the **Target console**: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+2. Compare that `SHA256:...` fingerprint with the one the Bastion shows. If they match, answer `yes`.
+
+Test it, still from the Bastion:
+
+```bash
+ssh target 'whoami; hostname'
+```
+
+It should ask for your **key passphrase** (not the account password) and print `secadmin` and `target`. If the key was dropped from the agent, that's normal.
+
+Pin the trust decision on the Bastion by adding one line under `Host target` in `~/.ssh/config`:
+
+```
+    StrictHostKeyChecking yes
+```
+
+### Step B: Write the hardening drop-in (on the Target)
+
+Open an SSH session from the Bastion (`ssh target`), keep the Target console logged in as a fallback, and run:
+
+```bash
+sudo nano /etc/ssh/sshd_config.d/00-hardening.conf
+```
+```
+# Authentication
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+AllowGroups lab-admins lab-operators
+
+# Throttling
+MaxAuthTries 3
+LoginGraceTime 30
+MaxSessions 4
+MaxStartups 10:30:60
+
+# Forwarding / attack surface
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitTunnel no
+Compression no
+TCPKeepAlive no
+
+# Session hygiene
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Logging and banner
+LogLevel VERBOSE
+Banner /etc/issue.net
+
+# Crypto (OpenSSH 9.6 on Ubuntu 24.04)
+HostKey /etc/ssh/ssh_host_ed25519_key
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+```
+
+Create the login banner:
+
+```bash
+echo 'Authorized access only. Activity is monitored and logged.' | sudo tee /etc/issue.net
+```
+
+### Step C: Validate, then apply
+
+```bash
+sudo sshd -t && echo "syntax OK"
+sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|allowgroups|maxauthtries|allowtcpforwarding|loglevel)'
+sudo systemctl restart ssh
+```
+
+`sshd -T` prints the **effective** configuration after all includes, so it is the ground truth. If a value isn't what you wrote, another file is winning.
+
+**Do not close your current session yet.** Open a *new* connection from the Bastion (`ssh target`) and confirm it works. If it doesn't, use the console to fix it, or roll back:
+
+```bash
+sudo rm /etc/ssh/sshd_config.d/00-hardening.conf && sudo systemctl restart ssh
+```
+
+### Step D: Prove the negatives (from the Bastion)
+
+```bash
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password secadmin@target
+ssh -i ~/.ssh/id_ed25519_lab root@target
+ssh -i ~/.ssh/id_ed25519_lab operator1@target
+```
+
+All three must end in `Permission denied (publickey)`.
+
+Note that `operator1` can no longer log in over SSH: the role is allowed, but no key has been issued. That is least privilege working as designed. The console remains available.
+
+### Step E: fail2ban (reconnect NAT briefly)
+
+1. In VMware, on the **Target**: **Settings → Network Adapter 2 → ☑ Connected**.
+2. On the Target (console or SSH):
+
+```bash
+sudo apt update
+sudo apt install -y fail2ban nftables python3-systemd
+```
+
+We install `nftables` and `python3-systemd` explicitly because the minimized image may not pull them in, and we need both: nftables for the ban action, the Python module so fail2ban can read the journal.
+
+```bash
+sudo nano /etc/fail2ban/jail.local
+```
+```
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 3
+backend = systemd
+banaction = nftables
+banaction_allports = nftables
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+mode = aggressive
+port = ssh
+```
+
+We never edit `jail.conf` (package updates overwrite it). `mode = aggressive` also catches the "connection closed by invalid user" patterns that key-only servers produce, which the normal mode would miss.
+
+```bash
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status sshd
+```
+
+**Test the ban from the Bastion.** Run this four or five times:
+
+```bash
+ssh baduser@target
+```
+
+Then on the Target:
+
+```bash
+sudo fail2ban-client status sshd
+sudo nft list ruleset | grep -i -A3 f2b
+```
+
+Your Bastion IP (`10.10.10.10`) should be listed as banned, and `ssh -o ConnectTimeout=5 target` from the Bastion should now fail. **Unban it** so you can continue:
+
+```bash
+sudo fail2ban-client set sshd unbanip 10.10.10.10
+```
+
+**If failures aren't counted** (`Total failed` stays 0): check `sudo fail2ban-client get sshd journalmatch` and `sudo journalctl -u ssh --no-pager | tail`. The sshd filter has to match the journal unit name your system actually logs under (`ssh.service` here). Send me the output and we'll adjust.
+
+### Step F: Close the NAT window and snapshot
+
+1. Uncheck **Connected** on Network Adapter 2 (or power off, uncheck *Connect at power on*, and power on again).
+2. Confirm there is no default route (`ip route`).
+3. Power off both VMs cleanly and snapshot the Target as **`P4-ssh-hardening`**. A Bastion snapshot is optional, since only its `~/.ssh/config` changed.
+
+---
+
+## 3. Validation checklist
+
+**From the Bastion:**
+
+| # | Command | Expected |
+|---|---|---|
+| 1 | `ssh target 'whoami; hostname'` | Key passphrase prompt (no account password), then `secadmin` / `target` |
+| 2 | `ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password secadmin@target` | `Permission denied (publickey)` |
+| 3 | `ssh -i ~/.ssh/id_ed25519_lab root@target` | `Permission denied (publickey)` |
+| 4 | `ssh -i ~/.ssh/id_ed25519_lab operator1@target` | `Permission denied (publickey)` |
+| 5 | `grep target ~/.ssh/known_hosts` | Entry present (hashed) and `StrictHostKeyChecking yes` set |
+
+**On the Target:**
+
+| # | Command | Expected |
+|---|---|---|
+| 6 | `sudo sshd -t` | No output |
+| 7 | `sudo sshd -T \| grep -E '^(permitrootlogin\|passwordauthentication\|authenticationmethods\|allowgroups\|maxauthtries\|allowtcpforwarding\|loglevel)'` | `no`, `no`, `publickey`, `lab-admins lab-operators`, `3`, `no`, `VERBOSE` |
+| 8 | `ls -l /etc/ssh/sshd_config.d/` | `00-hardening.conf` present, `root root`, `644` |
+| 9 | `stat -c '%a %U %n' ~/.ssh ~/.ssh/authorized_keys` (as `secadmin`) | `700 secadmin`, `600 secadmin` |
+| 10 | `systemctl is-active ssh.socket ssh.service` | Informational. Record which is `active`. |
+| 11 | `sudo ss -tlnp \| grep sshd` | Listening on port 22 only |
+| 12 | `sudo journalctl -u ssh --no-pager \| grep Accepted \| tail -2` | Shows `Accepted publickey for secadmin ... ED25519 SHA256:...` (the VERBOSE fingerprint) |
+| 13 | `sudo systemctl is-active fail2ban` and `sudo fail2ban-client status` | `active`; jail list contains `sshd` |
+| 14 | Ban test from Step E | Bastion IP banned, then unbanned, then login works again |
+| 15 | After closing NAT: `ip route` | No default route |
+
+Save outputs as `~/evidence/p04.txt` on the Bastion if you want them for the README, and never include private keys or passphrases. Your host-key fingerprint comparison from Step A is nice README material too.

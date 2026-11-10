@@ -1,0 +1,175 @@
+# POINT 2: Bastion Node bootstrap
+
+## 1. Security rationale
+
+The Bastion is the most sensitive machine in the lab. It will hold the SSH private key that administers the Target and the GPG key that signs your commits, so a compromise here compromises everything downstream. That drives these choices:
+
+| Decision | Why |
+|---|---|
+| **Minimal toolset** | Every package is attack surface and something to patch. We install only what Module 1 needs. Ansible, Terraform and Docker come in later modules. |
+| **ed25519 keys, passphrase-protected** | Modern, small, fast, and no weak-parameter pitfalls like RSA. A passphrase means a stolen key file is useless without it. |
+| **`-a 100` KDF rounds** | Slows down offline brute force of the passphrase. |
+| **One key per purpose** | The key for administering the Target is separate from the one for GitHub (Point 9). A leak of one doesn't expose the other. |
+| **GPG: primary key + subkeys, 1-year expiry** | Expiry limits the damage of a forgotten or lost key. Subkeys can be rotated without changing your identity. |
+| **Short agent cache lifetimes** | The passphrase is not held in memory indefinitely. |
+| **Strict file permissions** | OpenSSH and GPG refuse or warn about loose permissions, and so do auditors. |
+
+All of the following runs **inside the Bastion**, as `labadmin`, never as root. Keep the NAT adapter connected for the updates.
+
+---
+
+## 2. Step-by-step instructions
+
+### Step A: Patch the Bastion
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt autoremove -y
+```
+
+If a kernel or libc update was installed, reboot: `sudo reboot`. Log back in afterwards.
+
+### Step B: Install the minimal toolset
+
+```bash
+sudo apt install -y git curl jq tmux tree ca-certificates
+```
+
+`gnupg` and `openssh-client` are already present on Ubuntu Server. Confirm that unattended security upgrades are active (this is the default):
+
+```bash
+systemctl is-enabled unattended-upgrades
+```
+
+### Step C: Name resolution for the lab
+
+The isolated network has no DNS, so we map the Target locally:
+
+```bash
+echo '10.10.10.20 target' | sudo tee -a /etc/hosts
+getent hosts target
+```
+
+### Step D: Generate the ed25519 SSH key
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -t ed25519 -a 100 -C "labadmin@bastion-lab" -f ~/.ssh/id_ed25519_lab
+```
+
+- When prompted, enter a **strong passphrase** (four or five random words). **Do not leave it empty.**
+- Use a different passphrase from your login password, and write it down offline on paper.
+
+Check the result:
+
+```bash
+chmod 600 ~/.ssh/id_ed25519_lab
+chmod 644 ~/.ssh/id_ed25519_lab.pub
+ssh-keygen -lf ~/.ssh/id_ed25519_lab.pub
+```
+
+Create a minimal client config:
+
+```bash
+nano ~/.ssh/config
+```
+```
+Host target
+    HostName 10.10.10.20
+    User labadmin
+    IdentityFile ~/.ssh/id_ed25519_lab
+    IdentitiesOnly yes
+```
+```bash
+chmod 600 ~/.ssh/config
+```
+
+We deploy the public key to the Target in **Point 4**. Don't do it yet. Point 3 first creates a dedicated admin user, and we'll update `User` in this file then.
+
+### Step E: Time-limited use of the key (ssh-agent)
+
+```bash
+eval "$(ssh-agent -s)"
+ssh-add -t 3600 ~/.ssh/id_ed25519_lab
+ssh-add -l
+```
+
+`-t 3600` removes the key from the agent after one hour.
+
+### Step F: Generate the GPG key
+
+Console sessions need the TTY variable so the passphrase prompt works:
+
+```bash
+echo 'export GPG_TTY=$(tty)' >> ~/.bashrc
+export GPG_TTY=$(tty)
+chmod 700 ~/.gnupg 2>/dev/null || true
+```
+
+Now create the key. Replace the name and email with yours. Use the email you will register on GitHub (a GitHub `noreply` address is a good privacy choice). Commit signatures only show as "Verified" if the email matches.
+
+```bash
+gpg --quick-generate-key "Your Name <you@example.com>" ed25519 cert,sign 1y
+```
+
+A pinentry screen asks for a passphrase. Use a strong one that is different from the SSH passphrase.
+
+Fetch the fingerprint and add an encryption subkey:
+
+```bash
+gpg --list-secret-keys --keyid-format=long --with-fingerprint
+gpg --quick-add-key <FINGERPRINT> cv25519 encr 1y
+```
+
+Check the revocation certificate. Modern GnuPG generates one automatically:
+
+```bash
+ls -l ~/.gnupg/openpgp-revocs.d/
+```
+
+Shorten the agent's passphrase cache:
+
+```bash
+cat >> ~/.gnupg/gpg-agent.conf <<'EOF'
+default-cache-ttl 600
+max-cache-ttl 3600
+EOF
+gpgconf --kill gpg-agent
+```
+
+### Step G: Snapshot
+
+Power off cleanly (`sudo poweroff`) and take a snapshot named **`P2-bastion-bootstrap`**.
+
+⚠️ This snapshot now contains your private key material, so the VM files on your host disk need the same protection as the keys themselves.
+
+---
+
+## 3. Validation checklist
+
+Run these on the **Bastion**. If you want evidence for the README, create `mkdir -p ~/evidence` and pipe outputs through `tee -a ~/evidence/p02.txt`. Public fingerprints are fine to record. **Never record passphrases or private keys.**
+
+| # | Command | Expected |
+|---|---|---|
+| 1 | `apt list --upgradable 2>/dev/null \| tail -n +2` | Empty (fully patched) |
+| 2 | `git --version; gpg --version \| head -1; ssh -V` | All three print versions |
+| 3 | `systemctl is-enabled unattended-upgrades` | `enabled` |
+| 4 | `getent hosts target` | `10.10.10.20 target` |
+| 5 | `stat -c '%a %n' ~/.ssh ~/.ssh/id_ed25519_lab ~/.ssh/id_ed25519_lab.pub ~/.ssh/config` | `700`, `600`, `644`, `600` |
+| 6 | `ssh-keygen -lf ~/.ssh/id_ed25519_lab.pub` | `256 SHA256:... labadmin@bastion-lab (ED25519)` |
+| 7 | `ssh-keygen -y -f ~/.ssh/id_ed25519_lab` | **Prompts for a passphrase** (proves it is protected). Press Ctrl+C to cancel. |
+| 8 | `gpg --list-secret-keys --keyid-format=long` | `sec ed25519 ... [SC] [expires: ...]` and `ssb cv25519 ... [E]` |
+| 9 | `echo "lab test" \| gpg --clearsign \| gpg --verify` | `Good signature from "Your Name <...>"` |
+| 10 | `ls ~/.gnupg/openpgp-revocs.d/` | One `.rev` file |
+| 11 | `ssh-add -l` | Lists your ed25519 key (agent running) |
+| 12 | `timedatectl \| grep -E 'synchronized\|NTP'` | `System clock synchronized: yes` |
+| 13 | `ss -tlnp` | **Still no listener on port 22** |
+| 14 | `ls ~/.ssh` and `ls ~/.gnupg` | No stray or unexpected files |
+
+**Troubleshooting:**
+- `gpg: signing failed: Inappropriate ioctl for device` → run `export GPG_TTY=$(tty)` again.
+- `Permissions ... are too open` from ssh → re-run the `chmod` commands from Step D.
+
+---
+
